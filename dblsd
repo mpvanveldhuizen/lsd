@@ -1,0 +1,43 @@
+#!/bin/bash
+
+set -e
+
+if [ -f "$1" ]; then
+	echo $1 already exists, specify new file
+	exit 2
+fi
+
+echo building database, this will take a while...
+
+sqlite3 $1 "create table libs(symbol TEXT, object TEXT, file TEXT, hash TEXT, path TEXT, size TEXT, start TEXT);"
+
+find -H / -name "*.a" -type f -print 2> /dev/null | while read f; do
+	name=$(basename $f)
+	path=$(dirname $f)
+	
+	nm -S $f | while read g; do
+		line=$(echo $g | sed -n 's/\(.*\.o\):/\1/p')
+		symbol=$(echo $g | sed -n 's/^.*[tT]\ //p')
+
+		if [ -n "$line" ]; then
+			object=$line
+		fi
+		
+		if [ -n "$object" ] && [ -n "$symbol" ]; then
+			size=$(echo $g | sed -n "s/^[0-f]*\s\([0-f]*\).*\ $symbol/\1/p" | sed -n 's/^0*//p')
+			ar x $f $object
+			if [ -z "$size" ]; then
+				rm "$object"
+				echo invalid size, skipping entry $object, $symbol, $g, $path, $name
+				continue
+			fi
+			start=$(objdump -Fd "$object" | sed -n "s/.* <$symbol> (File Offset: 0x\(.*\)):$/\1/p")
+			dd bs=1 skip="$((16#$start))" count="$((16#$size))" if="$object" of=.hash status=none
+			hash=$(sha256sum .hash | sed s/\ .*$//)
+			sqlite3 $1 "insert into libs values('$symbol', '$object', '$name', '$hash', '$path', '$size', '$start');" 
+			rm "$object"
+		fi
+
+	done
+done
+

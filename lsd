@@ -1,0 +1,53 @@
+#!/bin/bash
+
+set -e
+
+if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
+	echo invalid arguments
+	echo usage: lsd [file name] [database]
+	exit 2
+fi
+
+status=$(file -b $1 | grep 'not stripped')
+if [ -z "$status" ]; then 
+	echo file $1 is stripped, exiting
+	exit 3
+fi
+
+echo checking for dynamic libraries \(ldd\)
+echo $(ldd $1)
+
+nm -S $1 | while read g; do
+
+	symbol=$(echo $g | sed -n 's/^.*[tT]\ //p')
+	offset=$(echo $g | sed -n "s/^\([0-f]*\)\s[0-f]*.*\ $symbol/\1/p")
+	size=$(echo $g | sed -n "s/^[0-f]*\s\([0-f]*\).*\ $symbol/\1/p" | sed -n 's/^0*//p')	
+
+	if [ -n "$symbol" ] && [ -n "$size" ]; then
+		start=$(objdump -Fd "$1" | sed -n "s/$offset.*<$symbol> (File Offset: 0x\(.*\)):$/\1/p")
+		dd bs=1 skip="$((16#$start))" count="$((16#$size))" if="$1" of=.lsdhash status=none
+		hash=$(sha256sum .lsdhash | sed s/\ .*$//)
+		sqlite3 $2 "select * from libs where symbol=\"$symbol\";" | while read f; do
+			dbhash=$(echo $f | awk -F '|' '{ print $4 }')
+			if [ "$dbhash" = "$hash" ]; then
+				echo $f | awk -F '|' '{ print "<" $1 ">" " hash match " $5 "/" $3 ": " $2}'
+			else
+				dbsize=$(echo $f | awk -F '|' '{print $6}')
+				dbstart=$(echo $f | awk -F '|' '{print $7}')
+				dbobject=$(echo $f | awk -F '|' '{print $2}')
+				dbpath=$(echo $f | awk -F '|' '{print $5}')
+				dbname=$(echo $f | awk -F '|' '{print $3}')
+				dbsymbol=$(echo $f | awk -F '|' '{print $1}')
+				if [ "$dbsize" = "$size" ]; then
+					ar x $dbpath/$dbname $dbobject
+					dd bs=1 skip="$((16#$dbstart))" count="$((16#$dbsize))" if="$dbobject" of=.dbhash status=none
+					total=$((16#$dbsize))
+					numdiff=$(($total - $(cmp -l .dbhash .lsdhash | wc -l)))
+					likely=$(echo "scale=4; ($numdiff/$total)" | bc -l)
+					echo "<$dbsymbol> prob match $dbpath/$dbname: $dbobject $likely"
+					rm $dbobject
+				fi
+			fi
+		done
+	fi
+done
